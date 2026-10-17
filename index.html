@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Rally Drag Prototype (Art Style)</title>
+<style>
+html,body{margin:0;height:100%;background:#2a3320;overflow:hidden;overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+canvas{display:block;width:100%;height:100%;touch-action:none}
+</style></head><body><canvas id="c"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   RALLY DRAG PROTOTYPE - single file, vanilla JS. Units: 1 world unit ~ 1px
+   World: x right, y DOWN (car travels toward negative y). Heading 0 = up,
+   positive heading = clockwise (right). forward = (sin h, -cos h).
+   ===================================================================== */
+
+/* ---------- TUNING CONSTANTS (edit these to change feel) ---------- */
+// Speed
+const MAX_SPEED = 380;        // top speed (units/s) at start
+const SPEED_RAMP = 0.3;      // extra top speed at full difficulty (+35%)
+const ACCEL = 520;            // acceleration toward target speed
+const BRAKE = 420;            // deceleration when finger is closer than current speed implies
+const COAST_DECEL = 150;      // slow-down when finger lifted
+// Finger distance -> speed curve
+const FINGER_MIN = 15;        // px-ish (world units) behind car = slowest
+const FINGER_MAX = 158;       // distance for full speed
+const SPEED_CURVE = 1.4;      // >1 = need to pull further for speed, <1 = quick to speed
+const MIN_SPEED_FRAC = 0.3;   // speed fraction at FINGER_MIN
+// Steering
+const TURN_RATE = 3.4;        // max heading change rad/s (higher = sharper)
+const TURN_GAIN = 5;          // how fast heading chases finger angle (higher = snappier/twitchier)
+const STEER_REF = 34;         // min "behind" distance used for angle; bigger = less sensitive to sideways offset
+const MAX_STEER = 1.3;        // max heading from straight (rad, ~75deg)
+const STEER_DEADZONE = 5;     // finger this close to car = hold heading
+const INVERT_STEER = false;   // false: finger pushes car AWAY (finger left of rear -> car goes right). true flips.
+// Drift / grip
+const DRIFT_GRIP = 3.0;       // lateral velocity decay per s (low = floaty drift, high = on rails)
+const OFFROAD_SPEED = 0.45;   // speed cap multiplier off road
+const OFFROAD_DRAG = 1.5;     // extra slowdown off road
+const OFFROAD_GRIP_MULT = 0.6;
+const DUST_SLIP = 70;         // lateral speed that triggers dust
+// Track & difficulty
+const ROAD_W_START = 110, ROAD_W_END = 80, WIDEN_MAX = 40; // narrow on straights; widens on the OUTSIDE of turns by up to WIDEN_MAX (right turn -> widens left)
+const DIFF_DIST = 30000;      // distance (units) to reach full difficulty
+const CHUNK = 260;            // obstacle chunk length
+// Damage
+const MAX_DAMAGE = 100, DMG_PER_SPEED = 0.05, DMG_FREE = 60, MIN_DMG = 3, RESTITUTION = 0.35, HIT_COOLDOWN = 0.4;
+// View
+const VIEW_W = 230;           // world units visible across (phone portrait)
+const SPEED_ZOOM_OUT = 0.1;  // camera pulls back at speed
+const CAMERA_PITCH_DEG = 35;  // camera angle above horizontal (90 = pure top-down)
+const PITCH = Math.sin(CAMERA_PITCH_DEG * Math.PI / 180), HK = Math.cos(CAMERA_PITCH_DEG * Math.PI / 180); // ground squash / height lift
+const CAR_SCREEN_Y = 0.68;    // car vertical position (fraction of screen); leaves room for thumb below
+const CAM_ROT = 3.5;          // how fast the camera swings to follow the car heading
+const HAIRPIN_CHANCE = 0.06, SHARP_CHANCE = 0.14, STRAIGHT_CHANCE = 0.3, HAIRPIN_DEG = 160, SHARP_GAP = 700, HAIRPIN_GAP = 1800; // min distance (units) between sharp turns // share of segments that are 180 / 90 degree turns (hairpins grow with distance)
+const CAR_R = 12;
+const STEP = 1 / 120;         // fixed physics step
+const SHOW_FINGER = true;     // draw finger marker + line to car
+
+/* ---------- SETUP ---------- */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0, dpr = 1, zoom = 1, baseZoom = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1; W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  baseZoom = Math.min(W / VIEW_W, H / (VIEW_W * 2)); zoom = baseZoom;
+}
+window.addEventListener('resize', resize); resize();
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const wrap = a => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
+const rng = s => () => { s |= 0; s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+let best = 0;
+try { best = parseInt(localStorage.getItem('rallyBest') || '0', 10) || 0; } catch (e) {}
+
+/* ---------- INPUT (first finger only; mouse for desktop) ---------- */
+const input = { down: false, x: 0, y: 0, id: null };
+function setP(p) { const r = cv.getBoundingClientRect(); input.x = p.clientX - r.left; input.y = p.clientY - r.top; }
+cv.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (input.id === null) { const t = e.changedTouches[0]; input.id = t.identifier; setP(t); input.down = true; onTap(); }
+}, { passive: false });
+cv.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) if (t.identifier === input.id) setP(t);
+}, { passive: false });
+const endTouch = e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) if (t.identifier === input.id) { input.id = null; input.down = false; }
+};
+cv.addEventListener('touchend', endTouch, { passive: false });
+cv.addEventListener('touchcancel', endTouch, { passive: false });
+cv.addEventListener('mousedown', e => { setP(e); input.down = true; onTap(); });
+window.addEventListener('mousemove', e => { if (input.down) setP(e); });
+window.addEventListener('mouseup', () => { input.down = false; });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------- TRACK GENERATION (endless, deterministic function of distance t) ---------- */
+const TS = 8;                         // track sample spacing (units)
+var TRK, runSeed = 1, camA = 0;      // track polyline; camera angle (camera rotates to follow the car)
+const diffAt = s => clamp(s / DIFF_DIST, 0, 1);
+const roadWidth = s => ROAD_W_START + (ROAD_W_END - ROAD_W_START) * diffAt(s);
+function initTrack() { runSeed = (Math.random() * 1e9) | 0; TRK = { x: [0], y: [0], h: [0], w: [ROAD_W_START], n: 1, H: 0, seg: 0, hp: false, last: -9999, e: [] }; extendTrack(900); }
+function extendTrack(sMax) { while (TRK.n * TS < sMax) genSeg(); }
+function genSeg() { // append one segment (straight, curve, sharp 90, hairpin); candidates that would hit the existing road are rejected
+  const T = TRK, s = T.n * TS, d = diffAt(s);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const r = rng(runSeed + T.seg * 977 + attempt * 131), u = r(), v = r();
+    const pick = Math.abs(T.H) > .9 ? -Math.sign(T.H) : (r() < .5 ? -1 : 1); // keeps overall heading near "up"
+    let ang = 0, R = 200, len = 0, hp = false, sharp = false;
+    if (s < 500) len = 500 - s;
+    else if (attempt === 9) len = 150;                                           // fallback: straight
+    else if (T.hp) { ang = T.hs * (Math.PI - HAIRPIN_DEG * Math.PI / 180); R = 300; } // straighten out so the legs of a hairpin stay parallel
+    else if (u < STRAIGHT_CHANCE) len = 120 + r() * 220;
+    else if (s > 1800 && s - T.last > HAIRPIN_GAP && v < HAIRPIN_CHANCE + .05 * d) { ang = (T.H > 0 ? -1 : 1) * HAIRPIN_DEG * Math.PI / 180; R = 125 + r() * 30; hp = sharp = true; }
+    else if (s > 1000 && s - T.last > SHARP_GAP && v < SHARP_CHANCE) { ang = pick * Math.PI / 2; R = 120 + r() * 30; sharp = true; }
+    else { ang = pick * (.35 + r() * .6); R = 240 + r() * 120; }
+    const steps = Math.max(1, Math.round((ang ? Math.abs(ang) * R : len) / TS)), dh = ang / steps, px = [], py = [], ph = [];
+    let x = T.x[T.n - 1], y = T.y[T.n - 1], h = T.h[T.n - 1], bad = false;
+    for (let i = 0; i < steps; i++) { h += dh; x += Math.sin(h) * TS; y -= Math.cos(h) * TS; px.push(x); py.push(y); ph.push(h); }
+    if (attempt < 9 && s > 500) { // overlap test against earlier road (skip the most recent ~400 units)
+      const m = roadWidth(s) + WIDEN_MAX + 30;
+      for (let i = 0; i < steps && !bad; i += 2) for (let k = Math.max(0, T.n - 1200); k < T.n - 50; k++) { const ex = px[i] - T.x[k], ey = py[i] - T.y[k]; if (ex * ex + ey * ey < m * m) { bad = true; break; } }
+    }
+    if (bad) continue;
+    for (let i = 0; i < steps; i++) { T.h.push(ph[i]); T.x.push(px[i]); T.y.push(py[i]); T.w.push(roadWidth(T.n * TS)); T.n++; }
+    T.H += ang; T.hp = hp; if (hp) T.hs = Math.sign(ang); if (sharp) T.last = s; T.seg++; return;
+  }
+}
+const chunks = new Map();
+function edgeOf(i) { // [left, right] half-widths at sample i: base width + extra on the outside of the local turn
+  let e = TRK.e[i]; if (e) return e;
+  const a = Math.max(1, i - 8), b = Math.min(TRK.n - 1, i + 8); let sum = 0;
+  for (let k = a; k <= b; k++) sum += TRK.h[k] - TRK.h[k - 1];
+  const curv = sum / ((b - a + 1) * TS), ex = WIDEN_MAX * clamp(Math.abs(curv) * 150, 0, 1), base = TRK.w[i] / 2; // curv > 0 = right turn
+  e = curv > 0 ? [base + ex, base] : [base, base + ex];
+  if (i + 8 < TRK.n) TRK.e[i] = e; return e;
+}
+function tooClose(x, y, j) { // is (x,y) on/next to any part of the road (incl. other legs of a hairpin)?
+  for (let k = Math.max(0, j - 90); k < Math.min(TRK.n, j + 90); k++) { const dx = x - TRK.x[k], dy = y - TRK.y[k], lat = dx * Math.cos(TRK.h[k]) + dy * Math.sin(TRK.h[k]), e = edgeOf(k), m = (lat > 0 ? e[1] : e[0]) + 14; if (dx * dx + dy * dy < m * m) return true; }
+  return false;
+}
+function genChunk(i) { // roadside scenery only - nothing on the road itself
+  const s0 = i * CHUNK; extendTrack(s0 + CHUNK + 800);
+  const r = rng(runSeed + i * 7919 + 13), d = diffAt(s0 + CHUNK / 2), list = [];
+  const at = (s, off) => { const j = Math.min(TRK.n - 1, Math.floor(s / TS)), h = TRK.h[j]; return [TRK.x[j] + Math.cos(h) * off, TRK.y[j] + Math.sin(h) * off, j]; };
+  for (let s = s0 + r() * 14; s < s0 + CHUNK; s += 30 - d * 6 + r() * 8) for (const sd of [-1, 1]) { // tree lines hugging both edges
+    if (r() > .85) continue;
+    const e = edgeOf(Math.min(TRK.n - 2, Math.floor(s / TS))), p = at(s, sd * ((sd < 0 ? e[0] : e[1]) + 20 + r() * 16));
+    if (!tooClose(p[0], p[1], p[2])) list.push({ k: 'tree', x: p[0], y: p[1], r: 9, cr: 18 + r() * 8, v: r() * 6, c: r() < .65 ? 'pineA' : 'pineB' });
+  }
+  for (let n = 0, nSide = Math.floor(3 + d * 2); n < nSide; n++) { // scattered extras further out
+    const s = s0 + r() * CHUNK, sd = r() < .5 ? -1 : 1, e = edgeOf(Math.min(TRK.n - 2, Math.floor(s / TS))), p = at(s, sd * ((sd < 0 ? e[0] : e[1]) + 45 + r() * 170));
+    if (tooClose(p[0], p[1], p[2])) continue;
+    list.push(r() < .7 ? { k: 'tree', x: p[0], y: p[1], r: 9, cr: 20 + r() * 8, v: r() * 6, c: r() < .65 ? 'pineA' : 'pineB' } : { k: 'rock', x: p[0], y: p[1], r: 9 + r() * 7, v: r() * 6 });
+  }
+  return list;
+}
+const getChunk = i => { let c = chunks.get(i); if (!c) { c = genChunk(i); chunks.set(i, c); } return c; };
+
+/* ---------- GAME STATE ---------- */
+let state = 'start', overAt = 0, now = 0;
+let car, cam, damage, shake, hitCd, dist, particles;
+function reset() {
+  car = { x: 0, y: 0, h: 0, vx: 0, vy: 0, slip: 0, off: false, si: 0, vl: 0 };
+  cam = { x: 0, y: 0 }; damage = 0; shake = 0; hitCd = 0; dist = 0; particles = []; chunks.clear(); skids = []; lastSk = [null, null]; initTrack(); camA = 0;
+}
+reset();
+function onTap() {
+  if (state === 'start') { reset(); state = 'play'; }
+  else if (state === 'over' && now - overAt > 600) { reset(); state = 'play'; }
+}
+function gameOver() {
+  state = 'over'; overAt = now;
+  const s = Math.floor(dist / 10);
+  if (s > best) { best = s; try { localStorage.setItem('rallyBest', String(best)); } catch (e) {} }
+}
+
+/* ---------- CAR PHYSICS ---------- */
+const maxSpeedNow = () => MAX_SPEED * (1 + SPEED_RAMP * diffAt(dist));
+function updateCar(dt, playing) {
+  const c = car; extendTrack((c.si + 120) * TS);
+  let bi = c.si, bd = 1e12; // nearest track sample (windowed search) -> progress + on/off road
+  for (let k = Math.max(0, c.si - 40); k <= c.si + 40 && k < TRK.n; k++) { const ex = c.x - TRK.x[k], ey = c.y - TRK.y[k], e = ex * ex + ey * ey; if (e < bd) { bd = e; bi = k; } }
+  c.si = bi; { const lat = (c.x - TRK.x[bi]) * Math.cos(TRK.h[bi]) + (c.y - TRK.y[bi]) * Math.sin(TRK.h[bi]), e = edgeOf(bi); c.off = lat > 0 ? lat > e[1] + 4 : -lat > e[0] + 4; }
+  // finger offset from car in camera space (camera rotates with the car, so screen-up = camA direction)
+  const dx = (input.x - W / 2) / zoom, dy = (input.y - H * CAR_SCREEN_Y) / (zoom * PITCH), fd = Math.hypot(dx, dy);
+  const fwdx = Math.sin(c.h), fwdy = -Math.cos(c.h), rx = Math.cos(c.h), ry = Math.sin(c.h);
+  let vF = c.vx * fwdx + c.vy * fwdy, vL = c.vx * rx + c.vy * ry;
+  const cap = maxSpeedNow() * (c.off ? OFFROAD_SPEED : 1);
+  const active = playing && input.down;
+  if (active) {
+    // heading: finger direction relative to car (pushed away from finger), car chases it with limited turn rate
+    if (fd > STEER_DEADZONE) {
+      const sgn = INVERT_STEER ? 1 : -1;
+      const want = camA + clamp(Math.atan2(sgn * dx, Math.max(dy, STEER_REF)), -MAX_STEER, MAX_STEER);
+      const sf = clamp(Math.abs(vF) / 80, 0, 1); // can't pivot when stopped
+      c.h += clamp(wrap(want - c.h) * TURN_GAIN, -TURN_RATE, TURN_RATE) * sf * dt;
+    }
+    // speed: finger distance behind car -> target speed
+    const f = clamp((dy - FINGER_MIN) / (FINGER_MAX - FINGER_MIN), 0, 1); // speed from how far BEHIND the car the finger is (sideways swings don't add speed)
+    const target = Math.min(cap, MAX_SPEED * (1 + SPEED_RAMP * diffAt(dist)) * (MIN_SPEED_FRAC + (1 - MIN_SPEED_FRAC) * Math.pow(f, SPEED_CURVE)));
+    if (vF < target) vF += Math.min(ACCEL * dt, target - vF); else vF -= Math.min(BRAKE * dt, vF - target);
+  } else vF = Math.max(0, vF - COAST_DECEL * dt);
+  if (c.off) { vF -= vF * OFFROAD_DRAG * dt; if (vF > cap) vF -= (vF - cap) * Math.min(1, 6 * dt); }
+  vL *= Math.exp(-DRIFT_GRIP * (c.off ? OFFROAD_GRIP_MULT : 1) * dt); // drift: lateral velocity decays
+  c.vx = fwdx * vF + rx * vL; c.vy = fwdy * vF + ry * vL;
+  c.x += c.vx * dt; c.y += c.vy * dt; c.slip = Math.abs(vL); c.vl = vL; skidUpdate(fwdx, fwdy, rx, ry, playing && (c.slip > SKID_SLIP || (c.off && vF > 80)));
+  if (playing) dist = Math.max(dist, c.si * TS);
+  // dust / skid particles
+  const rate = (c.slip > DUST_SLIP ? 60 : 0) + (c.off && vF > 60 ? 40 : 0);
+  if (Math.random() < rate * dt && particles.length < 220) {
+    const s = Math.random() < .5 ? -1 : 1;
+    particles.push({ x: c.x - fwdx * 14 + rx * 7 * s, y: c.y - fwdy * 14 + ry * 7 * s, vx: c.vx * .1 + (Math.random() - .5) * 30, vy: c.vy * .1 + (Math.random() - .5) * 30, life: 0, max: .5 + Math.random() * .4, r: 3 + Math.random() * 3, off: c.off });
+  }
+}
+
+/* ---------- COLLISIONS ---------- */
+function hit(nx, ny, pen) {
+  const c = car; c.x += nx * pen; c.y += ny * pen;
+  const vn = c.vx * nx + c.vy * ny;
+  if (vn < 0) {
+    c.vx -= (1 + RESTITUTION) * vn * nx; c.vy -= (1 + RESTITUTION) * vn * ny; c.vx *= .92; c.vy *= .92;
+    if (hitCd <= 0 && state === 'play') {
+      damage += Math.max(MIN_DMG, (-vn - DMG_FREE) * DMG_PER_SPEED); hitCd = HIT_COOLDOWN;
+      shake = Math.min(14, 3 - vn * .03);
+      if (damage >= MAX_DAMAGE) { damage = MAX_DAMAGE; gameOver(); }
+    }
+  }
+}
+function collide() {
+  const c = car, ci = Math.floor(c.si * TS / CHUNK);
+  for (let i = ci - 2; i <= ci + 2; i++) for (const o of getChunk(i)) {
+    if (o.k === 'barrier') { // axis-aligned rectangle vs circle
+      const px = clamp(c.x, o.x - o.hw, o.x + o.hw), py = clamp(c.y, o.y - o.hh, o.y + o.hh);
+      const dx = c.x - px, dy = c.y - py, d = Math.hypot(dx, dy);
+      if (d < CAR_R) d > 0 ? hit(dx / d, dy / d, CAR_R - d) : hit(0, -1, CAR_R);
+    } else {
+      const dx = c.x - o.x, dy = c.y - o.y, d = Math.hypot(dx, dy), m = CAR_R + o.r;
+      if (d < m) d > 0 ? hit(dx / d, dy / d, m - d) : hit(0, -1, m);
+    }
+  }
+}
+
+/* ---------- UPDATE (fixed timestep) ---------- */
+function update(dt) {
+  const playing = state === 'play';
+  if (state !== 'start') { updateCar(dt, playing); collide(); }
+  hitCd -= dt; shake *= Math.exp(-8 * dt);
+  cam.x = car.x; cam.y = car.y; camA += wrap(car.h - camA) * Math.min(1, CAM_ROT * dt); zoom = baseZoom * (1 - SPEED_ZOOM_OUT * clamp(Math.hypot(car.vx, car.vy) / MAX_SPEED, 0, 1.3));
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i]; p.life += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.r += 10 * dt;
+    if (p.life > p.max) particles.splice(i, 1);
+  }
+  const ci = Math.floor(car.si * TS / CHUNK);
+  for (const k of chunks.keys()) if (k < ci - 3) chunks.delete(k);
+}
+
+/* ---------- ART STYLE (Art of Rally-ish): flat-shaded low-poly meshes, biome palettes, skid marks ----------
+   Meshes are face lists in local space (x right, y down/back, z up), rotated by heading, projected with the
+   same oblique camera (screen = x, y*PITCH - z*HK), back-face culled, sorted, and flat shaded by a light vector. */
+const hex = h => [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
+const rgb = (c, k = 1) => `rgb(${Math.min(255, c[0] * k) | 0},${Math.min(255, c[1] * k) | 0},${Math.min(255, c[2] * k) | 0})`;
+const BIOMES = [ // palettes cycle with distance; edit colours freely
+  { ground: '#b8692f', groundB: '#c47c3a', road: '#e6c79a', verge: '#b08a5e', pineA: '#2f6b4f', pineB: '#e0a030', rock: '#9a8f86', hay: '#e8c05a', dust: '#e9cfa6' },
+  { ground: '#5f8f45', groundB: '#6fa04f', road: '#d8c9a8', verge: '#9c8a62', pineA: '#1f5a44', pineB: '#3f8f5a', rock: '#8c9098', hay: '#d9b64e', dust: '#d8d0b8' },
+  { ground: '#a8567a', groundB: '#b9638a', road: '#f0cfae', verge: '#a67b73', pineA: '#5a3b73', pineB: '#e0707a', rock: '#8c7f8e', hay: '#f0c060', dust: '#f3d6c0' }
+].map(b => { for (const k in b) b[k] = hex(b[k]); return b; });
+const BIOME_LEN = 6000, BIOME_BLEND = 900, SKID_SLIP = 45;
+const pal = {}; for (const k in BIOMES[0]) pal[k] = [0, 0, 0];
+function updatePalette() {
+  const i = Math.floor(dist / BIOME_LEN), f = clamp((dist - (i + 1) * BIOME_LEN + BIOME_BLEND) / BIOME_BLEND, 0, 1), a = BIOMES[i % 3], b = BIOMES[(i + 1) % 3];
+  for (const k in pal) for (let j = 0; j < 3; j++) pal[k][j] = a[k][j] + (b[k][j] - a[k][j]) * f;
+}
+const _l = [-.45, .3, .85], _m = Math.hypot(..._l), LX = _l[0] / _m, LY = _l[1] / _m, LZ = _l[2] / _m;
+function face(out, vs, col, c0) { // add a flat face; normal oriented away from part centre c0
+  const a = vs[0], b = vs[1], c = vs[2];
+  let n = [(b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]), (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]), (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])];
+  const m = Math.hypot(n[0], n[1], n[2]) || 1, g = [0, 1, 2].map(i => vs.reduce((s, p) => s + p[i], 0) / vs.length);
+  n = n.map(v => v / m); if (n[0] * (g[0] - c0[0]) + n[1] * (g[1] - c0[1]) + n[2] * (g[2] - c0[2]) < 0) n = n.map(v => -v);
+  out.push({ v: vs, n, c: col, g });
+}
+function frustum(out, cx, cy, z0, z1, bx, by, tx, ty, dy, col, top) { // box/tapered box; top rect can shift by dy
+  const B = [[cx - bx, cy - by, z0], [cx + bx, cy - by, z0], [cx + bx, cy + by, z0], [cx - bx, cy + by, z0]];
+  const T = [[cx - tx, cy + dy - ty, z1], [cx + tx, cy + dy - ty, z1], [cx + tx, cy + dy + ty, z1], [cx - tx, cy + dy + ty, z1]], c0 = [cx, cy + dy / 2, (z0 + z1) / 2];
+  for (let i = 0; i < 4; i++) { const j = (i + 1) % 4; face(out, [B[i], B[j], T[j], T[i]], col, c0); }
+  face(out, T, top || col, c0);
+}
+function ngon(out, cx, cy, z0, z1, n, r0, r1, col, rnd, jit, top) { // cone / cylinder / jittered rock
+  const Bv = [], Tv = [];
+  for (let i = 0; i < n; i++) { const a = i / n * 6.2832, j = rnd ? 1 + (rnd() - .5) * jit : 1; Bv.push([cx + Math.cos(a) * r0 * j, cy + Math.sin(a) * r0 * j, z0]); Tv.push([cx + Math.cos(a) * r1 * j, cy + Math.sin(a) * r1 * j, z1]); }
+  const c0 = [cx, cy, (z0 + z1) / 2];
+  for (let i = 0; i < n; i++) { const j = (i + 1) % n; face(out, r1 > 0 ? [Bv[i], Bv[j], Tv[j], Tv[i]] : [Bv[i], Bv[j], Tv[0]], col, c0); }
+  if (r1 > 0) face(out, Tv, top || col, c0);
+}
+function drawMesh(faces, x, y, rot, lean) {
+  const vp = toView(x, y), px = vp[0], py = vp[1], cs = Math.cos(rot - camA), sn = Math.sin(rot - camA), vis = [];
+  for (const f of faces) {
+    const nx = f.n[0] * cs - f.n[1] * sn, ny = f.n[0] * sn + f.n[1] * cs;
+    if (ny * HK + f.n[2] * PITCH <= 0) continue; // back-face cull
+    vis.push({ f, nx, ny, k: (py + f.g[0] * sn + f.g[1] * cs) * HK + f.g[2] * PITCH });
+  }
+  vis.sort((a, b) => a.k - b.k);
+  for (const o of vis) {
+    const s = .52 + .62 * Math.max(0, o.nx * LX + o.ny * LY + o.f.n[2] * LZ), c = typeof o.f.c === 'string' ? pal[o.f.c] : o.f.c, col = rgb(c, s);
+    ctx.beginPath();
+    o.f.v.forEach((p, i) => { const lx = p[0] + (lean || 0) * p[2], sx = px + lx * cs - p[1] * sn, sy = (py + lx * sn + p[1] * cs) * PITCH - p[2] * HK; i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); });
+    ctx.closePath(); ctx.fillStyle = col; ctx.strokeStyle = col; ctx.lineWidth = .6; ctx.fill(); ctx.stroke();
+  }
+}
+const CARM = (() => { // low-poly rally hatch
+  const o = [], B = hex('#e24a2e'), D = hex('#262626'), G = hex('#9fc7d6'), W = hex('#f4f0e6'), Y = hex('#ffd86a'), R = hex('#ff4a3a');
+  for (const [wx, wy] of [[-10, -12], [10, -12], [-10, 12], [10, 12]]) frustum(o, wx, wy, 0, 6.5, 2.4, 4.5, 2.4, 4.5, 0, D);
+  frustum(o, 0, 0, 3, 9, 10, 19, 9, 17.5, 0, B);          // body
+  frustum(o, 0, -8, 9, 9.4, 2, 8, 2, 8, 0, W);            // racing stripe
+  frustum(o, 0, 1.5, 9, 14.5, 8, 8.5, 6.8, 5.5, 1.5, G, B); // glass cabin + roof
+  frustum(o, 0, -19, 3, 5.5, 9.5, 1.2, 9.5, 1.2, 0, D);   // splitter
+  frustum(o, -6, 16, 9, 12.5, .8, .8, .8, .8, 0, D); frustum(o, 6, 16, 9, 12.5, .8, .8, .8, .8, 0, D);
+  frustum(o, 0, 16.5, 12.5, 13.6, 10.5, 2.2, 10.5, 2.2, 0, B); // spoiler
+  frustum(o, -3.5, -1.5, 14.5, 16.2, 1.8, 1.4, 1.8, 1.4, 0, Y); frustum(o, 3.5, -1.5, 14.5, 16.2, 1.8, 1.4, 1.8, 1.4, 0, Y); // roof lights
+  frustum(o, -6.5, -18.6, 5.5, 8, 2.2, .7, 2.2, .7, 0, Y); frustum(o, 6.5, -18.6, 5.5, 8, 2.2, .7, 2.2, .7, 0, Y);
+  frustum(o, -6.5, 18.2, 5.5, 8, 2.2, .7, 2.2, .7, 0, R); frustum(o, 6.5, 18.2, 5.5, 8, 2.2, .7, 2.2, .7, 0, R);
+  return o;
+})();
+const treeMesh = o => { const m = [], r = rng(Math.floor(o.v * 1e4) + 7), c = o.cr * .85, T = hex('#5a3a22');
+  ngon(m, 0, 0, 0, 7, 5, 2.4, 2, T, null, 0);
+  ngon(m, 0, 0, 5, 17, 6, c, 0, o.c, r, .25); ngon(m, 0, 0, 13, 25, 6, c * .78, 0, o.c, r, .25); ngon(m, 0, 0, 21, 34, 6, c * .54, 0, o.c, r, .25); return m; };
+const rockMesh = o => { const m = [], r = rng(Math.floor(o.v * 1e4) + 3); ngon(m, 0, 0, 0, o.r * .95, 6, o.r, o.r * .5, 'rock', r, .5); return m; };
+const barrierMesh = o => { const m = [], n = Math.max(2, Math.round(o.hw / 11)), w = o.hw / n; for (let i = 0; i < n; i++) frustum(m, -o.hw + w * (2 * i + 1), 0, 0, 9, w - .6, o.hh + 1, w - 1, o.hh + .4, 0, 'hay'); return m; };
+function shadow(x, y, rx, ry, rot) {
+  ctx.save(); const v = toView(x, y); ctx.translate(v[0] + 6, v[1] * PITCH + 1); ctx.scale(1, PITCH); ctx.rotate((rot || 0) - camA); ctx.fillStyle = 'rgba(25,10,10,.24)';
+  ctx.beginPath(); ctx.ellipse(0, 0, rx, ry, 0, 0, 7); ctx.fill(); ctx.restore();
+}
+function drawCar() {
+  if (hitCd > 0 && Math.floor(hitCd * 20) % 2) ctx.globalAlpha = .55;
+  shadow(car.x, car.y, 13, 21, car.h);
+  drawMesh(CARM, car.x, car.y, car.h, -clamp(car.vl / 450, -.14, .14)); // body roll from lateral slip
+  ctx.globalAlpha = 1;
+}
+var skids = [], lastSk = [null, null]; // persistent tyre marks (flat array of x0,y0,x1,y1)
+function skidUpdate(fx, fy, rx, ry, on) {
+  for (let k = 0; k < 2; k++) {
+    if (!on) { lastSk[k] = null; continue; }
+    const s = k ? 1 : -1, p = [car.x - fx * 12 + rx * 10 * s, car.y - fy * 12 + ry * 10 * s];
+    if (!lastSk[k]) lastSk[k] = p; else if (Math.hypot(p[0] - lastSk[k][0], p[1] - lastSk[k][1]) > 4) { skids.push(lastSk[k][0], lastSk[k][1], p[0], p[1]); lastSk[k] = p; }
+  }
+  if (skids.length > 6000) skids.splice(0, 1200);
+}
+function toView(x, y) { const dx = x - cam.x, dy = y - cam.y, c = Math.cos(camA), s = Math.sin(camA); return [dx * c + dy * s, -dx * s + dy * c]; } // world -> camera-aligned
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); updatePalette(); extendTrack((car.si + 250) * TS);
+  ctx.fillStyle = rgb(pal.ground); ctx.fillRect(0, 0, W, H);
+  const sh = shake > .3 ? shake : 0, ahead = H * CAR_SCREEN_Y / (zoom * PITCH) + 90, behind = H * (1 - CAR_SCREEN_Y) / (zoom * PITCH) + 60, side = W / 2 / zoom + 70, R = Math.hypot(side, ahead);
+  ctx.save();
+  ctx.translate(W / 2 + (Math.random() - .5) * sh, H * CAR_SCREEN_Y + (Math.random() - .5) * sh); ctx.scale(zoom, zoom);
+  ctx.save(); ctx.scale(1, PITCH); ctx.rotate(-camA); ctx.translate(-cam.x, -cam.y); // ground layer, drawn in world coords
+  ctx.fillStyle = rgb(pal.groundB);
+  for (let gy = Math.floor((cam.y - R) / 90); gy <= (cam.y + R) / 90; gy++) for (let gx = Math.floor((cam.x - R) / 90); gx <= (cam.x + R) / 90; gx++) {
+    const h = ((gx * 73856093) ^ (gy * 19349663)) >>> 0; if (h % 2) continue;
+    const cx = gx * 90 + (h >> 4) % 60, cy = gy * 90 + (h >> 9) % 60; ctx.beginPath();
+    for (let k = 0; k < 6; k++) { const a = k * 1.047 + ((h >> (k + 3)) & 3) * .15, r = 38 + ((h >> (k + 6)) & 7) * 4; k ? ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r) : ctx.moveTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r); }
+    ctx.fill();
+  }
+  const i0 = Math.max(0, car.si - 90), i1 = Math.min(TRK.n - 1, car.si + 190);
+  const edge = (i, o) => [TRK.x[i] + Math.cos(TRK.h[i]) * o, TRK.y[i] + Math.sin(TRK.h[i]) * o];
+  const ribbon = (ex, col) => {
+    ctx.beginPath();
+    for (let i = i0; i <= i1; i++) { const p = edge(i, -(edgeOf(i)[0] + ex)); i > i0 ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); }
+    for (let i = i1; i >= i0; i--) { const p = edge(i, edgeOf(i)[1] + ex); ctx.lineTo(p[0], p[1]); }
+    ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+  };
+  ribbon(11, rgb(pal.verge)); ribbon(0, rgb(pal.road));
+  ctx.lineWidth = 8; ctx.strokeStyle = rgb(pal.verge); ctx.globalAlpha = .22;
+  for (const off of [-17, 17]) { ctx.beginPath(); for (let i = i0; i <= i1; i++) { const p = edge(i, off); i > i0 ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); } ctx.stroke(); }
+  ctx.globalAlpha = 1; ctx.strokeStyle = 'rgba(40,24,12,.3)'; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < skids.length; i += 4) { ctx.moveTo(skids[i], skids[i + 1]); ctx.lineTo(skids[i + 2], skids[i + 3]); }
+  ctx.stroke(); ctx.restore();
+  for (const p of particles) { // dust puffs
+    const v = toView(p.x, p.y); ctx.globalAlpha = (1 - p.life / p.max) * .55; ctx.fillStyle = rgb(pal.dust, p.off ? .85 : 1);
+    ctx.beginPath(); ctx.arc(v[0], v[1] * PITCH - 5 * HK, p.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  const items = [{ y: 0, f: drawCar }], c0 = Math.floor(i0 * TS / CHUNK), c1 = Math.floor(i1 * TS / CHUNK);
+  for (let i = c0; i <= c1; i++) for (const o of getChunk(i)) {
+    const v = toView(o.x, o.y); if (Math.abs(v[0]) > side || v[1] < -ahead || v[1] > behind) continue;
+    items.push({ y: v[1], f: () => {
+      if (o.k === 'tree') { shadow(o.x, o.y, o.cr * .8, o.cr * .8); drawMesh(o.M || (o.M = treeMesh(o)), o.x, o.y, 0); }
+      else { shadow(o.x, o.y, o.r, o.r); drawMesh(o.M || (o.M = rockMesh(o)), o.x, o.y, 0); }
+    } });
+  }
+  items.sort((a, b) => a.y - b.y); for (const it of items) it.f();
+  ctx.restore();
+  const vg = ctx.createRadialGradient(W / 2, H * .55, Math.min(W, H) * .35, W / 2, H * .55, Math.max(W, H) * .75);
+  vg.addColorStop(0, 'rgba(30,12,10,0)'); vg.addColorStop(1, 'rgba(30,12,10,.45)'); ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+  drawHUD();
+}
+function drawHUD() {
+  ctx.textBaseline = 'alphabetic';
+  const score = Math.floor(dist / 10), m = 16, tp = 30;
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, W, 70);
+  ctx.fillStyle = '#fff'; ctx.font = '700 28px system-ui,sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(score + ' m', m, tp + 6);
+  ctx.font = '600 13px system-ui,sans-serif'; ctx.fillStyle = '#ddd';
+  ctx.fillText('BEST ' + Math.max(best, score) + ' m', m, tp + 26);
+  const bw = Math.min(140, W * .35), bx = W - bw - m;
+  ctx.textAlign = 'right'; ctx.fillText('DAMAGE', W - m, tp - 4);
+  ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(bx, tp + 2, bw, 14);
+  const f = damage / MAX_DAMAGE;
+  ctx.fillStyle = `hsl(${120 * (1 - f)},80%,50%)`; ctx.fillRect(bx, tp + 2, bw * f, 14);
+  if (SHOW_FINGER && state === 'play' && input.down) {
+    const sx = W / 2 + (car.x - cam.x) * zoom, sy = H * CAR_SCREEN_Y;
+    ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(input.x, input.y); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.3)'; ctx.beginPath(); ctx.arc(input.x, input.y, 26, 0, 7); ctx.fill();
+  }
+  if (state !== 'play') {
+    ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+    if (state === 'start') {
+      ctx.font = '800 44px system-ui,sans-serif'; ctx.fillText('RALLY DRAG', W / 2, H * .3);
+      ctx.font = '500 16px system-ui,sans-serif'; ctx.fillStyle = '#ddd';
+      ctx.fillText('Hold your finger BEHIND the car', W / 2, H * .3 + 36);
+      ctx.fillText('Left/right of it = steer, further = faster', W / 2, H * .3 + 60);
+      ctx.fillStyle = '#fff'; ctx.font = '700 24px system-ui,sans-serif'; ctx.fillText('TAP TO BEGIN', W / 2, H * .55);
+    } else {
+      ctx.font = '800 38px system-ui,sans-serif'; ctx.fillText('WRECKED', W / 2, H * .3);
+      ctx.font = '700 28px system-ui,sans-serif'; ctx.fillText(score + ' m', W / 2, H * .3 + 46);
+      ctx.font = '500 16px system-ui,sans-serif'; ctx.fillStyle = '#ddd'; ctx.fillText('Best ' + best + ' m', W / 2, H * .3 + 72);
+      ctx.fillStyle = '#fff'; ctx.font = '700 24px system-ui,sans-serif'; ctx.fillText('TAP TO RETRY', W / 2, H * .55);
+    }
+  }
+}
+
+/* ---------- MAIN LOOP ---------- */
+let last = 0, acc = 0;
+function frame(ts) {
+  now = ts; const dt = Math.min(.1, (ts - last) / 1000); last = ts; acc += dt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render(); requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script></body></html>
